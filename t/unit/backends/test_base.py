@@ -2296,6 +2296,26 @@ class test_KeyValueStoreBackend:
         assert len(polls) == 1
         assert clock.now == pytest.approx(0.6)
 
+    def test_get_many__timeout_none_does_not_raise(self):
+        """A timeout of None must not raise at the deadline checks (#11111).
+
+        With no deadline, both timeout checks must short-circuit instead
+        of raising: the ids stay pending so the loop reaches the checks
+        instead of breaking early on `if not ids`, and max_iterations=1
+        ends the loop without sleeping.
+        """
+        self.b._cache.clear()
+        ids = [uuid() for _ in range(4)]
+
+        # Keep ids pending so the loop doesn't break early on `if not ids`.
+        self.b.mget = Mock(return_value=[None for _ in ids])
+
+        # max_iterations=1 closes the loop without hitting the sleep.
+        got = list(self.b.get_many(ids, timeout=None, interval=0.2,
+                                   max_iterations=1))
+
+        assert got == []
+
     def test_get_many_passes_ready_states(self):
         tasks_length = 10
         ready_states = frozenset({states.SUCCESS})
