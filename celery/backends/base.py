@@ -9,6 +9,7 @@ import sys
 import time
 import warnings
 from collections import deque, namedtuple
+from contextvars import ContextVar
 from datetime import timedelta
 from functools import partial
 from time import monotonic
@@ -22,6 +23,7 @@ from kombu.serialization import dumps, loads, prepare_accept_content
 from kombu.serialization import registry as serializer_registry
 from kombu.utils.encoding import bytes_to_str, ensure_bytes
 from kombu.utils.url import maybe_sanitize_url
+from kombu.utils.uuid import uuid
 
 import celery.exceptions
 from celery import chord, current_app, group, maybe_signature, states
@@ -57,6 +59,18 @@ EXCEPTION_ABLE_CODECS = frozenset({'pickle'})
 COMPRESSED_PAYLOAD_MAGIC = b'\x00celery-compressed\x00'
 
 logger = get_logger(__name__)
+
+#: How long :meth:`Backend.store_result` keeps retrying an error that is safe
+#: to retry: a ``(timeout, not_after)`` tuple, where ``not_after`` is a
+#: :func:`time.monotonic` time it must give up by, or :const:`None` to raise at
+#: once. The worker sets it while it stores a task's state (see
+#: :func:`celery.app.trace.build_tracer`), so stores made from the worker's
+#: main process, or from the task body, still fail fast.
+_store_retry = ContextVar('store_retry', default=None)
+
+#: The longest sleep between tries while :data:`_store_retry` is set, so a
+#: store goes through soon after the backend is back.
+_STORE_RETRY_MAX_SLEEP = 1.0
 
 MESSAGE_BUFFER_MAX = 8192
 
@@ -827,40 +841,53 @@ class Backend:
     def _sleep(self, amount):
         time.sleep(amount)
 
-    def _ensure_retryable(self, func, *args, fallback_exc=None, fallback_msg=None, max_retries=None, **kwargs):
-        """Helper to execute a function with the backend's retry policy."""
+    def _ensure_retryable(self, func, *args, fallback_exc=None, fallback_msg=None, max_retries=None,
+                          deadline=None, **kwargs):
+        """Helper to execute a function with the backend's retry policy.
+
+        Errors that are safe to retry are retried up to ``max_retries`` times
+        with :setting:`result_backend_always_retry`, and, if ``deadline`` (a
+        :func:`time.monotonic` time) is given, until that time too.
+        """
         retries = 0
         limit = self.max_retries if max_retries is None else max_retries
         while True:
             try:
                 return func(*args, **kwargs)
             except Exception as exc:
-                if self.always_retry and self.exception_safe_to_retry(exc):
-                    if retries < limit:
-                        retries += 1
-                        logger.warning(
-                            'Failed operation %s. Retrying %s more times.',
-                            getattr(func, '__name__', repr(func)), limit - retries,
-                            exc_info=True)
-                        try:
-                            self.on_backend_retryable_error(exc)
-                        except Exception:
-                            logger.exception(
-                                "on_backend_retryable_error hook failed; continuing retry loop",
-                            )
-
-                        # get_exponential_backoff_interval computes integers
-                        # and time.sleep accept floats for sub second sleep
-                        sleep_amount = get_exponential_backoff_interval(
-                            self.base_sleep_between_retries_ms, retries,
-                            self.max_sleep_between_retries_ms, True) / 1000
-                        self._sleep(sleep_amount)
-                    else:
-                        if fallback_exc:
-                            raise_with_context(fallback_exc(fallback_msg))
-                        raise
-                else:
+                if not self.exception_safe_to_retry(exc):
                     raise
+                by_count = self.always_retry and retries < limit
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if not by_count and not (remaining and remaining > 0):
+                    if self.always_retry and fallback_exc:
+                        raise_with_context(fallback_exc(fallback_msg))
+                    raise
+                retries += 1
+                name = getattr(func, '__name__', repr(func))
+                if deadline is None:
+                    logger.warning(
+                        'Failed operation %s. Retrying %s more times.',
+                        name, limit - retries, exc_info=True)
+                try:
+                    self.on_backend_retryable_error(exc)
+                except Exception:
+                    logger.exception(
+                        "on_backend_retryable_error hook failed; continuing retry loop",
+                    )
+
+                # get_exponential_backoff_interval computes integers
+                # and time.sleep accept floats for sub second sleep
+                sleep_amount = get_exponential_backoff_interval(
+                    self.base_sleep_between_retries_ms, retries,
+                    self.max_sleep_between_retries_ms, True) / 1000
+                if deadline is not None:
+                    if remaining > 0:
+                        sleep_amount = min(sleep_amount, _STORE_RETRY_MAX_SLEEP, remaining)
+                    logger.warning(
+                        'Failed operation %s: %r. Retrying in %.2fs.',
+                        name, exc, sleep_amount)
+                self._sleep(sleep_amount)
 
     def store_result(self, task_id, result, state,
                      traceback=None, request=None, **kwargs):
@@ -871,6 +898,14 @@ class Backend:
         """
         result = self.encode_result(result, state)
 
+        deadline = None
+        retry = _store_retry.get()
+        if retry is not None:
+            timeout, not_after = retry
+            deadline = time.monotonic() + timeout
+            if not_after is not None:
+                deadline = min(deadline, not_after)
+
         # Pass the values by position, as 5.6 did: backends outside Celery,
         # such as django-celery-results, name these parameters differently.
         self._ensure_retryable(
@@ -879,6 +914,7 @@ class Backend:
             fallback_exc=partial(BackendStoreError, task_id=task_id, state=state),
             fallback_msg="failed to store result on the backend",
             request=request,
+            deadline=deadline,
             **kwargs
         )
         return result
@@ -929,6 +965,16 @@ class Backend:
         to define which exceptions are safe.
         """
         return False
+
+    def _store_error_safe_to_retry(self, exc):
+        """Check if a failed :meth:`store_result` is safe to retry.
+
+        True if the error, or the error that a :exc:`BackendStoreError`
+        was raised from, is safe to retry.
+        """
+        if isinstance(exc, BackendStoreError) and exc.__cause__ is not None:
+            exc = exc.__cause__
+        return self.exception_safe_to_retry(exc)
 
     def on_backend_retryable_error(self, exc):
         """Hook called before retrying a recoverable backend exception."""
@@ -1330,6 +1376,8 @@ class BaseKeyValueStoreBackend(Backend):
     group_keyprefix = 'celery-taskset-meta-'
     chord_keyprefix = 'chord-unlock-'
     implements_incr = False
+    #: Set by backends with ``_add_chord_key(key, token)``: add unless present.
+    implements_add = False
 
     def __init__(self, *args, **kwargs):
         if hasattr(self.key_t, '__func__'):  # pragma: no cover
@@ -1393,6 +1441,88 @@ class BaseKeyValueStoreBackend(Backend):
 
     def incr(self, key):
         raise NotImplementedError('Does not implement incr')
+
+    def _chord_key_expires(self, result_ttl=None):
+        # Twice the header results' lifetime, including the backend's own
+        # result TTL: a header's key outlives its result, and the done key
+        # outlives late copies of header tasks. 0 means no expiry.
+        expires = self._chord_result_expires
+        return 2 * int(max(expires, result_ttl or 0)) if expires else 0
+
+    def _claim_chord(self, group_id):
+        """Return :const:`True` for the one run that completes or fails it."""
+        return self._add_chord_key(
+            self.get_key_for_chord(group_id, '.done'), uuid())
+
+    def _fail_chord_once(self, request, message):
+        if self._claim_chord(request.group):
+            try:
+                raise ChordError(message)
+            except ChordError as exc:
+                self.chord_error_from_stack(
+                    maybe_signature(request.chord, app=self.app), exc)
+
+    def _chord_part_returns(self, request):
+        """Record that a header part returned; fail the chord if it can't."""
+        if not self.implements_add:
+            return True
+        # A failure is stored even when the result is ignored, if the task
+        # sets store_errors_even_if_ignored: only a header with nothing
+        # stored fails the chord here.
+        if (_is_request_ignore_result(request)
+                and self._missing_results([request.id])):
+            self._fail_chord_once(
+                request, f'Chord header task {request.task}[{request.id}] '
+                'ignores its result: header tasks must store it')
+            return False
+        self._add_chord_key(
+            self._get_key_for_chord_part(request.group, request.id), uuid())
+        return True
+
+    def _delete_chord_part_keys(self, group_id, deps):
+        # The chord's done key stays: it stops a late copy of a header task.
+        # Header entries can share a task id, and so a key.
+        if self.implements_add:
+            self._delete_keys(list(dict.fromkeys(
+                self._get_key_for_chord_part(group_id, result.id)
+                for result in deps.results)))
+
+    def _delete_keys(self, keys):
+        for key in keys:
+            self.delete(key)
+
+    def _get_key_for_chord_part(self, group_id, task_id):
+        # As a str, so that every backend reads it back with mget().
+        return bytes_to_str(self.get_key_for_chord(group_id, f'.{task_id}'))
+
+    def _chord_keys_exist(self, keys):
+        values = self.mget(keys)
+        if hasattr(values, 'items'):
+            values = [values.get(key) for key in keys]
+        return [value is not None for value in values]
+
+    def _complete_chord_once(self, request, deps):
+        """Return :const:`True` for the one run that completes the chord.
+
+        A missing result whose header returned was lost: fail the chord.
+        """
+        missing = self._missing_results([r.id for r in deps.results])
+        if missing and all(self._chord_keys_exist([
+                self._get_key_for_chord_part(request.group, task_id)
+                for task_id in missing])):
+            # A header stores its result before its key, so one that
+            # returned between the two reads shows up on a second read.
+            missing = self._missing_results(missing)
+            if missing:
+                self._fail_chord_once(
+                    request,
+                    f'Chord header results missing: {", ".join(missing)}')
+        return not missing and self._claim_chord(request.group)
+
+    def _missing_results(self, ids):
+        ready = self._mget_to_results(
+            self.mget([self.get_key_for_task(task_id) for task_id in ids]), ids)
+        return [task_id for task_id in ids if task_id not in ready]
 
     def expire(self, key, value):
         pass
@@ -1610,6 +1740,10 @@ class BaseKeyValueStoreBackend(Backend):
                 ChordError(f'Cannot restore group: {exc!r}'),
             )
         if deps is None:
+            # A copy that returns after the chord completed finds it claimed.
+            # Otherwise the group expired: fail the chord, once.
+            if self.implements_add and not self._claim_chord(gid):
+                return
             try:
                 raise ValueError(gid)
             except ValueError as exc:
@@ -1619,16 +1753,23 @@ class BaseKeyValueStoreBackend(Backend):
                     callback,
                     ChordError(f'GroupResult {gid} no longer exists'),
                 )
+        if not self._chord_part_returns(request):
+            return
         val = self.incr(key)
         # Set the chord size to the value defined in the request, or fall back
         # to the number of dependencies we can see from the restored result
         size = request.chord.get("chord_size")
         if size is None:
             size = len(deps)
-        if val > size:  # pragma: no cover
+        if val > size and not self.implements_add:  # pragma: no cover
             logger.warning('Chord counter incremented too many times for %r',
                            gid)
-        elif val == size:
+        elif val >= size:
+            # A header task that runs again counts again, so the counter can
+            # reach the size before every header returned.
+            if self.implements_add and not self._complete_chord_once(
+                    request, deps):
+                return
             callback = maybe_signature(request.chord, app=app)
             j = deps.join_native if deps.supports_native_join else deps.join
             try:
@@ -1659,6 +1800,7 @@ class BaseKeyValueStoreBackend(Backend):
             finally:
                 deps.delete()
                 self.delete(key)
+                self._delete_chord_part_keys(gid, deps)
                 # The chord is done: give the header results back their
                 # normal lifetime.
                 for dep in deps.results:

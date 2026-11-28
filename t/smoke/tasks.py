@@ -10,6 +10,7 @@ from time import sleep
 import celery.utils
 from celery import Task, current_app, shared_task, signature
 from celery.canvas import Signature
+from celery.exceptions import Ignore
 from t.integration.tasks import *  # noqa
 from t.integration.tasks import replaced_with_me
 
@@ -94,6 +95,11 @@ def non_eta_task_with_retries(self):
     return self.request.retries
 
 
+@shared_task(rate_limit="5/s")
+def rate_limited_noop():
+    """Do nothing, at most 5 times each second on each worker. For rate limit tests."""
+
+
 @shared_task
 def summarize_results(results):
     """Sum a list of results. For chord callback tests."""
@@ -121,3 +127,8 @@ def kill_child_process_once(marker="/tmp/kill_child_process_once"):
         open(marker, "w").close()
         os._exit(1)
     return "survived"
+
+
+@shared_task
+def ignores():
+    raise Ignore()

@@ -478,6 +478,53 @@ class test_State:
         assert task2.root is task
         assert task2 in task.children
 
+    def test_task_ignored_event_sets_ignored_state(self):
+        # Issue #11093: task-ignored is a terminal event for monitors.
+        state = State()
+        state.event({
+            'type': 'task-started', 'uuid': 'x', 'hostname': 'h',
+            'timestamp': 1.0, 'local_received': 1.0, 'clock': 1,
+            'name': 'proj.add', 'args': '(2, 2)', 'kwargs': '{}',
+        })
+        state.event({
+            'type': 'task-ignored', 'uuid': 'x', 'hostname': 'h',
+            'timestamp': 2.0, 'local_received': 2.0, 'clock': 2,
+        })
+        task = state.tasks['x']
+        assert task.state == states.IGNORED
+        assert task.ignored == 2.0
+
+    def test_task_ignored_is_kept_and_exported(self):
+        # A task-started that arrives late must not move the task back,
+        # and the timestamp is part of what a monitor exports.
+        state = State()
+        tid = uuid()
+        for type_, clock in (('task-received', 1), ('task-started', 2),
+                             ('task-ignored', 3), ('task-started', 2)):
+            state.event({
+                'type': type_, 'uuid': tid, 'hostname': 'h', 'clock': clock,
+                'timestamp': float(clock), 'local_received': float(clock),
+            })
+        task = state.tasks[tid]
+        assert task.state == states.IGNORED
+        assert task.as_dict()['ignored'] == task.ignored
+
+    def test_task_ignored_is_not_ready(self):
+        # IGNORED is not in READY_STATES (it follows the REJECTED
+        # precedent), so a monitor still counts an ignored task as not
+        # ready; this pins that behaviour down.
+        state = State()
+        tid = uuid()
+        for type_, clock in (('task-received', 1), ('task-started', 2),
+                             ('task-ignored', 3)):
+            state.event({
+                'type': type_, 'uuid': tid, 'hostname': 'h', 'clock': clock,
+                'timestamp': float(clock), 'local_received': float(clock),
+            })
+        task = state.tasks[tid]
+        assert task.state == states.IGNORED
+        assert task.ready is False
+
     def test_task_children_set_if_received_in_wrong_order(self):
         r = ev_task_states(State())
         r.events.insert(0, r.events.pop())
@@ -573,6 +620,110 @@ class test_State:
 
         assert len(r.state.tasks_by_worker['utest1']) == 10
         assert len(r.state.tasks_by_worker['utest2']) == 10
+
+    def _task_event(self, state, type_, uuid, hostname, clock, **fields):
+        return state.event({
+            'type': type_,
+            'uuid': uuid,
+            'hostname': hostname,
+            'clock': clock,
+            'timestamp': time(),
+            'local_received': time(),
+            **fields,
+        })
+
+    def test_tasks_by_worker_with_task_sent_event(self):
+        # task-sent comes from the client and creates the task, the worker
+        # is only known from the events that follow.
+        s = State()
+        self._task_event(s, 'task-sent', 't1', 'client@vandelay.com', 1,
+                         name='task1')
+        assert 'client@vandelay.com' not in s.tasks_by_worker
+        assert list(s.tasks_by_worker('worker1')) == []
+
+        self._task_event(s, 'task-received', 't1', 'worker1', 2, name='task1')
+        self._task_event(s, 'task-started', 't1', 'worker1', 3)
+        task = s.tasks['t1']
+        assert 'client@vandelay.com' not in s.tasks_by_worker
+        assert set(s.tasks_by_worker['worker1']) == {task}
+        assert set(s.tasks_by_type['task1']) == {task}
+        assert [t for _, t in s.tasks_by_worker('worker1')] == [task]
+
+    def test_tasks_by_worker_task_sent_only(self):
+        s = State()
+        self._task_event(s, 'task-sent', 't1', 'client@vandelay.com', 1,
+                         name='task1')
+        assert not s.tasks_by_worker
+        assert list(s.tasks_by_worker('client@vandelay.com')) == []
+        assert list(s.tasks_by_worker('worker1')) == []
+
+    def test_tasks_by_worker_first_event_has_no_name(self):
+        s = State()
+        self._task_event(s, 'task-started', 't1', 'worker1', 1)
+        task = s.tasks['t1']
+        assert set(s.tasks_by_worker['worker1']) == {task}
+        assert not s.tasks_by_type
+
+        self._task_event(s, 'task-received', 't1', 'worker1', 2, name='task1')
+        assert set(s.tasks_by_worker['worker1']) == {task}
+        assert set(s.tasks_by_type['task1']) == {task}
+        assert [t for _, t in s.tasks_by_type('task1')] == [task]
+
+    def test_tasks_by_worker_task_moves_to_new_worker(self):
+        s = State()
+        self._task_event(s, 'task-received', 't1', 'worker1', 1, name='task1')
+        self._task_event(s, 'task-retried', 't1', 'worker1', 2)
+        self._task_event(s, 'task-received', 't1', 'worker2', 3, name='task1')
+        task = s.tasks['t1']
+        assert not s.tasks_by_worker['worker1']
+        assert set(s.tasks_by_worker['worker2']) == {task}
+        assert [t for _, t in s.tasks_by_worker('worker2')] == [task]
+        assert list(s.tasks_by_worker('worker1')) == []
+
+    def test_tasks_by_worker_follows_last_processed_event(self):
+        # events from different workers aren't ordered relative to each other,
+        # so a late event from the previous worker (older clock) that is
+        # processed after the new worker's event moves the task back, just
+        # like it does for task.worker.
+        s = State()
+        self._task_event(s, 'task-received', 't1', 'worker1', 1, name='task1')
+        self._task_event(s, 'task-received', 't1', 'worker2', 3, name='task1')
+        task = s.tasks['t1']
+        assert set(s.tasks_by_worker['worker2']) == {task}
+
+        self._task_event(s, 'task-retried', 't1', 'worker1', 2)
+        assert task.worker.hostname == 'worker1'
+        assert set(s.tasks_by_worker['worker1']) == {task}
+        assert not s.tasks_by_worker['worker2']
+        assert [t for _, t in s.tasks_by_worker('worker1')] == [task]
+        assert list(s.tasks_by_worker('worker2')) == []
+
+    def test_tasks_by_worker_worker_replaced_in_state(self):
+        # the Worker object can be dropped (offline, LRU eviction) and
+        # recreated, the task must stay indexed under that hostname.
+        s = State()
+        self._task_event(s, 'task-received', 't1', 'worker1', 1, name='task1')
+        task = s.tasks['t1']
+        del s.workers['worker1']
+        self._task_event(s, 'task-started', 't1', 'worker1', 2)
+        assert set(s.tasks_by_worker['worker1']) == {task}
+
+    def test_task_indexes_only_updated_when_changed(self):
+        s = State()
+        self._task_event(s, 'task-received', 't1', 'worker1', 1, name='task1')
+        task = s.tasks['t1']
+        by_type, by_worker = s.tasks_by_type['task1'], s.tasks_by_worker['worker1']
+        with patch.object(by_type, 'add') as add_type, \
+                patch.object(by_worker, 'add') as add_worker, \
+                patch.object(by_worker, 'discard') as discard_worker:
+            self._task_event(s, 'task-started', 't1', 'worker1', 2)
+            self._task_event(s, 'task-succeeded', 't1', 'worker1', 3,
+                             result='1', runtime=0.1)
+            add_type.assert_not_called()
+            add_worker.assert_not_called()
+            discard_worker.assert_not_called()
+        assert set(by_type) == {task}
+        assert set(by_worker) == {task}
 
     def test_survives_unknown_worker_event(self):
         s = State()
