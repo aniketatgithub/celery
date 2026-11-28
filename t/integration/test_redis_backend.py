@@ -1,3 +1,4 @@
+import socket
 import threading
 from types import SimpleNamespace
 
@@ -304,3 +305,37 @@ def test_chord_part_return_records_each_header_task_once(
     finally:
         client.delete(*keys)
         backend.forget(body_id)
+
+
+def test_result_stored_during_pubsub_reconnect_is_received(app):
+    # Regression test for #11089: a result stored after the last read and
+    # before the new subscribe must still be received after the pub/sub
+    # connection is lost and re-established.
+    if not app.conf.result_backend.startswith('redis'):
+        pytest.skip('Requires redis result backend.')
+
+    backend = app.backend
+    task_id = uuid()
+    result = app.AsyncResult(task_id)
+    backend.add_pending_result(result)
+    mget = backend.client.mget
+    stored = []
+
+    def mget_then_store(keys):
+        metas = mget(keys)
+        if not stored:
+            # The task ends after this read and before the new subscribe.
+            backend.store_result(task_id, 42, states.SUCCESS)
+            stored.append(task_id)
+        return metas
+
+    backend.client.mget = mget_then_store
+    try:
+        # The pub/sub connection is lost.
+        pubsub = backend.result_consumer._pubsub
+        pubsub.connection._sock.shutdown(socket.SHUT_RDWR)
+
+        assert result.get(timeout=5) == 42
+    finally:
+        backend.client.mget = mget
+        backend.forget(task_id)
